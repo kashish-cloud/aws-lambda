@@ -12,13 +12,24 @@ const logger = winston.createLogger({
 });
 
 exports.handler = async (event, context) => {
+  const isValidZip = (fileContent) => {
+    try {
+      const AdmZip = require("adm-zip");
+      const zip = new AdmZip(fileContent);
+      const zipEntries = zip.getEntries();
+      return zipEntries.length > 0;
+    } catch (error) {
+      return false;
+    }
+  };
+
   try {
     console.log("Entered serverless code");
     console.log("SNS Message:", event.Records[0].Sns.Message);
     // Extract user information from SNS message
     const snsMessage = JSON.parse(event.Records[0].Sns.Message);
     const firstName = snsMessage.firstName;
-    const userEmail = snsMessage.email;
+    const userEmail = "desai.kashi@northeastern.edu";
     const submissionUrl = snsMessage.submissionUrl;
 
     // Get variables from environment
@@ -32,15 +43,38 @@ exports.handler = async (event, context) => {
     }
 
     // Action 1: Download file from URL and upload to GCP Bucket
-    const fileContent = await downloadFile(submissionUrl);
-    await uploadToGCPBucket(fileContent, accessKey, gcpBucketName);
+    let successMessage = "";
+    let failureMessage = "";
 
-    // Action 2: Send email status via Mailgun
-    const emailStatus = "Success"; // or "Failure"
-    await sendEmailViaMailgun(userEmail, emailStatus);
+    try {
+      const fileContent = await downloadFile(submissionUrl);
+
+      // Check if the file is a valid .zip file
+      if (!isValidZip(fileContent)) {
+        throw new Error("Invalid or empty .zip file uploaded.");
+      }
+
+      await uploadToGCPBucket(fileContent, accessKey, gcpBucketName);
+
+      // Action 2: Send email status via Mailgun for success
+      const emailStatus = "Success";
+      successMessage = `Status of file download: ${emailStatus}. File path: gs://${gcpBucketName}/${submissionUrl}`;
+      await sendEmailViaMailgun(userEmail, emailStatus, successMessage);
+    } catch (error) {
+      // Action 2: Send email status via Mailgun for failure
+      const emailStatus = "Failure";
+      failureMessage = error.message || "Submission failed.";
+      await sendEmailViaMailgun(userEmail, emailStatus, failureMessage);
+    }
 
     // Action 3: Track emails sent in DynamoDB
     await trackEmailsInDynamoDB(userEmail, dynamoTableName);
+
+    if (successMessage) {
+      logger.info(successMessage);
+    } else if (failureMessage) {
+      logger.error(failureMessage);
+    }
   } catch (error) {
     logger.error("Error processing Lambda function:", error);
     throw error;
@@ -71,8 +105,11 @@ const uploadToGCPBucket = async (fileContent, accessKey, gcpBucketName) => {
     logger.info("Uploading to GCP Bucket:", gcpBucketName);
     logger.info("Content being parsed:", fileContent);
 
+    const decodedPrivateKey = Buffer.from(accessKey, "base64").toString(
+      "utf-8"
+    );
     // Parse the GCP credentials
-    const credentials = JSON.parse(accessKey);
+    const credentials = JSON.parse(decodedPrivateKey);
 
     // Create a new Storage client
     const storage = new Storage({
@@ -96,28 +133,32 @@ const uploadToGCPBucket = async (fileContent, accessKey, gcpBucketName) => {
 };
 
 // Send email via Mailgun
-const sendEmailViaMailgun = async (userEmail, emailStatus) => {
+const sendEmailViaMailgun = async (userEmail, emailStatus, message) => {
   logger.info(
-    "Sending email via Mailgun to:",
-    userEmail,
-    "with status:",
-    emailStatus
+    `Sending email via Mailgun to: ${userEmail} with status: ${emailStatus}`
   );
 
-  const mg = mailgun({
-    apiKey: process.env.MAILGUN_API_KEY,
-    domain: process.env.MAILGUN_DOMAIN,
-  });
-
-  const data = {
-    from: "desai.kashi@northeastern.edu",
-    to: userEmail,
-    subject: "File Download Status",
-    text: `Status of file download: ${emailStatus}`,
-  };
-
   try {
+    const mg = mailgun({
+      apiKey: process.env.MAILGUN_API_KEY,
+      domain: process.env.MAILGUN_DOMAIN,
+    });
+
+    logger.info("Mailgun client created");
+
+    const data = {
+      from: "info@kashishdesai.me",
+      to: "desai.kashi@northeastern.edu",
+      subject: "File Download Status",
+      text: `Status of file download: ${emailStatus}\n\n${
+        message || "Submission failed."
+      }`,
+    };
+
+    logger.info("Mailgun message data created");
+
     await mg.messages().send(data);
+
     logger.info("Email sent successfully.");
   } catch (error) {
     logger.error("Error sending email:", error);
@@ -138,6 +179,7 @@ const trackEmailsInDynamoDB = async (userEmail, dynamoTableName) => {
   const params = {
     TableName: dynamoTableName,
     Item: {
+      id: { S: `${Date.now()}_${userEmail}` },
       UserEmail: { S: userEmail },
       Timestamp: { N: `${Date.now()}` },
     },
